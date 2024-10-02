@@ -1,56 +1,47 @@
-"""
-Main package.
-"""
-
 import argparse
 import asyncio
 import sys
 from io import TextIOWrapper
 from typing import Any, TextIO, Union
-
 from . import Communicate, SubMaker, list_voices
 
 
-async def _print_voices(*, proxy: str) -> None:
-    """Print all available voices."""
-    voices = await list_voices(proxy=proxy)
-    voices = sorted(voices, key=lambda voice: voice["ShortName"])
+async def _print_voices(proxy: str) -> None:
+    """Print all available voices, sorted by ShortName."""
+    voices = sorted(await list_voices(proxy=proxy), key=lambda v: v["ShortName"])
     for idx, voice in enumerate(voices):
-        if idx != 0:
+        if idx > 0:
             print()
 
-        for key in voice.keys():
-            if key in (
+        for key, value in voice.items():
+            if key not in {
                 "SuggestedCodec",
                 "FriendlyName",
                 "Status",
                 "VoiceTag",
                 "Name",
                 "Locale",
-            ):
-                continue
-            pretty_key_name = key if key != "ShortName" else "Name"
-            print(f"{pretty_key_name}: {voice[key]}")
+            }:
+                print(f"{'Name' if key == 'ShortName' else key}: {value}")
 
 
 async def _run_tts(args: Any) -> None:
-    """Run TTS after parsing arguments from command line."""
-
-    try:
-        if sys.stdin.isatty() and sys.stdout.isatty() and not args.write_media:
-            print(
-                "Warning: TTS output will be written to the terminal. "
-                "Use --write-media to write to a file.\n"
-                "Press Ctrl+C to cancel the operation. "
-                "Press Enter to continue.",
-                file=sys.stderr,
-            )
+    """Run TTS and handle media and subtitle output."""
+    if sys.stdin.isatty() and sys.stdout.isatty() and not args.write_media:
+        print(
+            "Warning: TTS output will be written to the terminal. "
+            "Use --write-media to write to a file.\n"
+            "Press Ctrl+C to cancel the operation. "
+            "Press Enter to continue.",
+            file=sys.stderr,
+        )
+        try:
             input()
-    except KeyboardInterrupt:
-        print("\nOperation canceled.", file=sys.stderr)
-        return
+        except KeyboardInterrupt:
+            print("\nOperation canceled.", file=sys.stderr)
+            return
 
-    tts: Communicate = Communicate(
+    tts = Communicate(
         args.text,
         args.voice,
         proxy=args.proxy,
@@ -58,81 +49,82 @@ async def _run_tts(args: Any) -> None:
         volume=args.volume,
         pitch=args.pitch,
     )
-    subs: SubMaker = SubMaker()
-    with (
+
+    subs = SubMaker()
+    audio_output = (
         open(args.write_media, "wb") if args.write_media else sys.stdout.buffer
-    ) as audio_file:
+    )
+
+    async with audio_output:
         async for chunk in tts.stream():
             if chunk["type"] == "audio":
-                audio_file.write(chunk["data"])
+                audio_output.write(chunk["data"])
             elif chunk["type"] == "WordBoundary":
                 subs.create_sub((chunk["offset"], chunk["duration"]), chunk["text"])
 
-    sub_file: Union[TextIOWrapper, TextIO] = (
-        open(args.write_subtitles, "w", encoding="utf-8")
-        if args.write_subtitles
-        else sys.stderr
-    )
-    with sub_file:
-        sub_file.write(subs.generate_subs(args.words_in_cue))
+    if args.write_subtitles:
+        with open(args.write_subtitles, "w", encoding="utf-8") as sub_file:
+            sub_file.write(subs.generate_subs(args.words_in_cue))
+    else:
+        sys.stderr.write(subs.generate_subs(args.words_in_cue))
 
 
 async def amain() -> None:
-    """Async main function"""
+    """Parse arguments and run the appropriate TTS action."""
     parser = argparse.ArgumentParser(description="Microsoft Edge TTS")
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("-t", "--text", help="what TTS will say")
-    group.add_argument("-f", "--file", help="same as --text but read from file")
-    parser.add_argument(
-        "-v",
-        "--voice",
-        help="voice for TTS. Default: en-US-AriaNeural",
-        default="en-US-AriaNeural",
-    )
+    group.add_argument("-t", "--text", help="Text for TTS.")
+    group.add_argument("-f", "--file", help="Read text for TTS from file.")
     group.add_argument(
         "-l",
         "--list-voices",
-        help="lists available voices and exits",
         action="store_true",
+        help="List available voices and exit.",
     )
-    parser.add_argument("--rate", help="set TTS rate. Default +0%%.", default="+0%")
-    parser.add_argument("--volume", help="set TTS volume. Default +0%%.", default="+0%")
-    parser.add_argument("--pitch", help="set TTS pitch. Default +0Hz.", default="+0Hz")
+
+    parser.add_argument(
+        "-v",
+        "--voice",
+        default="en-US-AriaNeural",
+        help="TTS voice (default: en-US-AriaNeural).",
+    )
+    parser.add_argument("--rate", default="+0%", help="Set TTS rate (default: +0%).")
+    parser.add_argument(
+        "--volume", default="+0%", help="Set TTS volume (default: +0%)."
+    )
+    parser.add_argument(
+        "--pitch", default="+0Hz", help="Set TTS pitch (default: +0Hz)."
+    )
     parser.add_argument(
         "--words-in-cue",
-        help="number of words in a subtitle cue. Default: 10.",
         default=10,
-        type=float,
+        type=int,
+        help="Number of words in subtitle cue (default: 10).",
     )
     parser.add_argument(
-        "--write-media", help="send media output to file instead of stdout"
+        "--write-media", help="Send media output to file instead of stdout."
     )
     parser.add_argument(
-        "--write-subtitles",
-        help="send subtitle output to provided file instead of stderr",
+        "--write-subtitles", help="Send subtitle output to file instead of stderr."
     )
-    parser.add_argument("--proxy", help="use a proxy for TTS and voice list.")
+    parser.add_argument("--proxy", help="Use a proxy for TTS and voice list.")
+
     args = parser.parse_args()
 
     if args.list_voices:
         await _print_voices(proxy=args.proxy)
         sys.exit(0)
 
-    if args.file is not None:
-        # we need to use sys.stdin.read() because some devices
-        # like Windows and Termux don't have a /dev/stdin.
-        if args.file == "/dev/stdin":
-            args.text = sys.stdin.read()
-        else:
-            with open(args.file, "r", encoding="utf-8") as file:
-                args.text = file.read()
+    if args.file:
+        with open(args.file, "r", encoding="utf-8") as file:
+            args.text = file.read()
 
-    if args.text is not None:
+    if args.text:
         await _run_tts(args)
 
 
 def main() -> None:
-    """Run the main function using asyncio."""
+    """Run the asynchronous main function."""
     asyncio.run(amain())
 
 
